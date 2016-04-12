@@ -1,0 +1,14 @@
+
+*.pyc
+
+*.swp
+
+data/
+
+references/
+
+results/
+
+misc./
+
+*.ipynb
