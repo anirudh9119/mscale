@@ -171,9 +171,11 @@ def prepare_data(seqs_x, maxlen=None, n_words=30000):
         new_seqs_x = []
         new_lengths_x = []
         for l_x, s_x in zip(lengths_x, seqs_x):
-            if l_x <= maxlen:
-                new_seqs_x.append(s_x)
-                new_lengths_x.append(l_x)
+            if True:#l_x <= maxlen:
+                new_seqs_x.append(s_x[:maxlen])
+                new_lengths_x.append(min(l_x,maxlen))
+                #new_lengths_x.append(l_x)
+
         lengths_x = new_lengths_x
         seqs_x = new_seqs_x
 
@@ -236,10 +238,8 @@ def param_init_gru(options, params, prefix='gru', nin=None, dim=None, slow=False
     if slow:
         W_h = norm_weight(dim, dim)
         params[_p(prefix, 'W_h')] = W_h
-        #Should I include bias too ?
-        #params[_p(prefix, 'b_h')] = numpy.zeros((dim,)).astype('float32')
 
-    # embedding to hidden state proposal weights, biases
+
     Wx = norm_weight(nin, dim)
     params[_p(prefix, 'Wx')] = Wx
     params[_p(prefix, 'bx')] = numpy.zeros((dim,)).astype('float32')
@@ -251,12 +251,26 @@ def param_init_gru(options, params, prefix='gru', nin=None, dim=None, slow=False
     return params
 
 
+
 def gru_layer(tparams, state_below, options,
               new_mask, prefix='gru',
               mask=None, one_step=False, init_state=None,
               slow_rnn = False, slow_rnn_states=None,
               **kwargs):
 
+    '''
+    tparams - A Dictionary used to index all the shared params.
+    state_below - [Embedding matrix for the inputs] or [Encoded features
+                    for slow level RNN's]
+    New_mask - It contains 0's and 1's. If for a particular time step
+               it is 0, it means, you have to copy the hidden state.
+               if 1, it means, you have to update the hidden state.
+    one_step - For sampling
+    init_state - Initial_state while runing in sampling mode.
+    slow_rnn - Boolean, for hiddens which are updated not frequently.
+    slow_rnn_states - Interpolated hiddens, which are to be used for conditioning,
+                      lower levels (faster hidden's)
+    '''
     if one_step:
         assert init_state, 'previous state must be provided'
 
@@ -287,6 +301,7 @@ def gru_layer(tparams, state_below, options,
     state_belowx = tensor.dot(state_below, tparams[_p(prefix, 'Wx')]) + \
         tparams[_p(prefix, 'bx')]
 
+    # input to compute the conditioning effect of interpolated hiddens.
     state_hiddens=[]
     if slow_rnn:
         state_hiddens  = tensor.dot(slow_rnn_states, tparams[_p(prefix, 'W_h')])
@@ -312,13 +327,16 @@ def gru_layer(tparams, state_below, options,
 
         # if new_mask_ is 1, the first 2 terms, should be executed.
         # if new_mask_ is 0, the last term should be executed.
-
+        # For hiddens which are updated at every time step, new_mask_ should be 1,
+        # if hiddens are just copied from their previous values, new_mask_ should be 0.
         h = new_mask_[:,None] * (m_[:, None] * h) + new_mask_[:,None]* ((1. - m_)[:, None] * h_) + ((1. - new_mask_)[:, None] * h_)
         return h
 
 
     # For slow RNN!
     # arguments    | sequences |outputs-info| non-seqs
+    # h_slow_ is the interpolated hiddens, which is being used to condition
+    # to calculate h of this new RNN
     def _step_slice_slow(m_, x_, xx_, new_mask_, h_slow_ , h_, U, Ux):
         preact = tensor.dot(h_, U)
         preact += x_
@@ -331,6 +349,7 @@ def gru_layer(tparams, state_below, options,
         preactx = tensor.dot(h_, Ux)
         preactx = preactx * r
         preactx = preactx + xx_
+        # hidden state proposal is modified by conditioning.
         preactx = preactx + h_slow_
 
         # leaky integrate and obtain next hidden state
@@ -379,6 +398,8 @@ def gru_layer(tparams, state_below, options,
 
 
 # initialize all parameters
+# for slower hiddens, you have to specify the update, timings.
+# and, also the flag, slow=True should be set.
 def init_params(options):
     params = OrderedDict()
     # embedding
@@ -418,14 +439,21 @@ def get_sliced_hiddens(slow_hidden, alpha):
 
 def get_interpolated_hiddens(old_hidden,  n_timesteps, n_samples):
     '''
+
+        old_hidden: old_hidden_matrix which needs to be interpolated.
+
         number_of_reduced_timstamps
         alphas  = [1, 0.8, 0.6, 0.4, 0.2]
-        T.sum(alpha)
+        alpha is the interpolation mask as of now, which
+        needs to be passed as a function parameter.
     '''
     alpha = [0.5, 0.5]
     hidden_size = 1024
     batch_size = 32
+    # for ex, given hiddens, h1, h2, h3, h_n-1
+    # you get, [h1, h2], [h2,  h3], [h_n-2, h_n-1] so basically, n-1 pairs.
     num_cons_hiddens = 14
+    # number of interolations need to be done. i.e relative clock times.
     number_interp = 2
 
     #alpha = theano.vector('alpha')
@@ -472,12 +500,6 @@ def get_interpolated_hiddens(old_hidden,  n_timesteps, n_samples):
     zero_pad = tensor.zeros([out_batch.shape[0], number_interp , out_batch.shape[2]])
     out_batch = tensor.concatenate([zero_pad, out_batch], axis=1)
 
-
-
-#    compute = theano.function([X, alpha],
-#                              [out_batch, out],
-#                              allow_input_downcast=True,
-#                              on_unused_input='warn')
     return out_batch
 
 
@@ -690,11 +712,10 @@ def pred_probs(f_log_probs, prepare_data, options, iterator, verbose=True):
     probs = []
 
     n_done = 0
-
     for x in iterator:
         n_done += len(x)
 
-        x, x_mask = prepare_data(x, n_words=options['n_words'])
+        x, x_mask = prepare_data(x, maxlen=200,  n_words=options['n_words'])
 
         pprobs = f_log_probs(x, x_mask)
         for pp in pprobs:
@@ -997,7 +1018,13 @@ def train(dim_word=100,  # word vector dimensionality
                 print 'Minibatch with zero sample under length ', maxlen
                 uidx -= 1
                 continue
+            if x.shape[1] < 32:
+                uidx -= 1
+                continue
 
+
+
+            print x.shape
             ud_start = time.time()
             proj_h = get_hidden(x, x_mask)
             print numpy.asarray(proj_h).shape
