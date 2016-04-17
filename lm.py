@@ -715,7 +715,7 @@ def pred_probs(f_log_probs, prepare_data, options, iterator, verbose=True):
     for x in iterator:
         n_done += len(x)
 
-        x, x_mask = prepare_data(x, maxlen=200,  n_words=options['n_words'])
+        x, x_mask = prepare_data(x, maxlen=30,  n_words=options['n_words'])
 
         pprobs = f_log_probs(x, x_mask)
         for pp in pprobs:
