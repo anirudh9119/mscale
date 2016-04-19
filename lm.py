@@ -437,34 +437,46 @@ def get_sliced_hiddens(slow_hidden, alpha):
     Y = slow_hidden[alpha,:,:]
     return Y
 
-def get_interpolated_hiddens(old_hidden,  n_timesteps, n_samples):
+# TODO:
+# Give hidden_size
+# Give batch_size
+# Give interpolation masks.
+# Number of Interpolations to do!
+
+def get_interpolated_hiddens(old_hidden,  n_timesteps,
+                             n_samples, interpolation_mask,
+                             number_cons_hiddens):
     '''
-
         old_hidden: old_hidden_matrix which needs to be interpolated.
-
+                  : number_of_hiddens * batch_size * Hidden_Size
         number_of_reduced_timstamps
         alphas  = [1, 0.8, 0.6, 0.4, 0.2]
         alpha is the interpolation mask as of now, which
-        needs to be passed as a function parameter.
+        ne  eds to be passed as a function parameter.
+        For ex, given hiddens, h1, h2, h3, h_n-1
+        You get, [h1, h2], [h2,  h3], [h_n-2, h_n-1] so basically, n-1 pairs.
+        Number of interolations need to be done. i.e relative clock times.
     '''
-    alpha = [0.5, 0.5]
+    alpha = interpolation_mask
     hidden_size = 1024
     batch_size = 32
-    # for ex, given hiddens, h1, h2, h3, h_n-1
-    # you get, [h1, h2], [h2,  h3], [h_n-2, h_n-1] so basically, n-1 pairs.
-    num_cons_hiddens = 14
-    # number of interolations need to be done. i.e relative clock times.
-    number_interp = 2
 
-    #alpha = theano.vector('alpha')
+
+    num_cons_hiddens = number_cons_hiddens
+    num_reduced_hiddens = num_cons_hiddens + 1
+    number_interp = len(interpolation_mask)
+
     X  = old_hidden.dimshuffle(1, 0, 2)
     new_matrix2 = repeat(X, 2, axis=1)
     new_matrix2 = tensor.roll(new_matrix2, -1, axis=1)
-    new_matrix2 = new_matrix2[:, 0:n_timesteps-2, :]
-    new_matrix2 = new_matrix2.reshape([n_samples, (n_timesteps-2)/2, 2, hidden_size])
+    new_matrix2 = new_matrix2[:, 0:2*num_reduced_hiddens-2, :]
+    new_matrix2 = new_matrix2.reshape([n_samples, num_cons_hiddens, 2, hidden_size])
 
-    def _step_slice(m_, alpha):
-        return [alpha[0]* m_[0] + (1-alpha[0])*m_[1], alpha[1]* m_[0] + (1-alpha[1])*m_[1]]
+    def _step_slice(m_, interp_mask):
+        interp_ret = []
+        for i in range(number_interp):
+            interp_ret.append(interp_mask[i] * m_[0] + (1-interp_mask[i])* m_[1])
+        return interp_ret
 
     _step = _step_slice
 
@@ -499,12 +511,15 @@ def get_interpolated_hiddens(old_hidden,  n_timesteps, n_samples):
 
     zero_pad = tensor.zeros([out_batch.shape[0], number_interp , out_batch.shape[2]])
     out_batch = tensor.concatenate([zero_pad, out_batch], axis=1)
-
     return out_batch
 
+#TODO:
+#- Give different Masks for different time scales.
+#- Give the lamba's i.e the interpolation mask.
+#-
 
-# build a training model
-def build_model(tparams, options, new_mask, alpha):
+
+def build_model(tparams, options, new_mask, alpha, interpolation_mask):
     opt_ret = dict()
 
     trng = RandomStreams(1234)
@@ -513,6 +528,8 @@ def build_model(tparams, options, new_mask, alpha):
     # description string: #words x #samples
     x = tensor.matrix('x', dtype='int64')
     x_mask = tensor.matrix('x_mask', dtype='float32')
+    #new_mask = tensor.matrix('new_mask', dtype='float32')
+    #alpha = tensor.ivector('alpha_mask')
 
     n_timesteps = x.shape[0]
     n_samples = x.shape[1]
@@ -534,7 +551,9 @@ def build_model(tparams, options, new_mask, alpha):
     sliced_hiddens = get_sliced_hiddens(proj[0], alpha)
     interp_hiddens = get_interpolated_hiddens(sliced_hiddens,
                                               n_timesteps,
-                                              n_samples)
+                                              n_samples,
+                                              interpolation_mask,
+                                              number_cons_hiddens=5)
 
     interp_hiddens = interp_hiddens.dimshuffle(1,0,2)
     slow_rnn_hidden_states = interp_hiddens.astype('float32')
@@ -549,11 +568,8 @@ def build_model(tparams, options, new_mask, alpha):
 
     proj_h = proj[0]
     opt_ret['proj_h'] = proj_h
-
-
-
-    #get_hidden = theano.function([x, x_mask], interp_hiddens)
-    get_hidden = theano.function([x, x_mask], interp_hiddens.astype('float32'))
+    get_hidden = theano.function([x, x_mask, new_mask],
+                                 interp_hiddens.astype('float32'))
 
     # compute word probabilities
     logit_lstm = get_layer('ff')[1](tparams, proj_h, options,
@@ -574,14 +590,13 @@ def build_model(tparams, options, new_mask, alpha):
     cost = cost.reshape([x.shape[0], x.shape[1]])
     opt_ret['cost_per_sample'] = cost
     cost = (cost * x_mask).sum(0)
-
     return trng, use_noise, x, x_mask, opt_ret, cost, get_hidden
 
 
-# build a sampler
 def build_sampler(tparams, options, trng, new_mask):
     # x: 1 x 1
     y = tensor.vector('y_sampler', dtype='int64')
+    #new_mask = tensor.matrix('new_mask_sampling', dtype='int64')
     init_state = tensor.matrix('init_state', dtype='float32')
 
 
@@ -708,15 +723,17 @@ def gen_sample(tparams, f_next, f_next_slow, options, trng=None, maxlen=30, argm
 
 
 # calculate the log probablities on a given corpus using language model
-def pred_probs(f_log_probs, prepare_data, options, iterator, verbose=True):
+def pred_probs(f_log_probs, prepare_data,
+               options, iterator, verbose=False):
     probs = []
 
     n_done = 0
     for x in iterator:
         n_done += len(x)
-
         x, x_mask = prepare_data(x, maxlen=30,  n_words=options['n_words'])
-
+        if x.shape[1] < 32:
+            print 'something fishy is going on'
+            continue;
         pprobs = f_log_probs(x, x_mask)
         for pp in pprobs:
             probs.append(pp)
@@ -859,10 +876,47 @@ def sgd(lr, tparams, grads, x, mask, y, cost):
     return f_grad_shared, f_update
 
 
+
+
+
+
+def time_mask(update_freq, maxlen, batch_size):
+    '''
+    update_freq- after how many time steps, hiddens
+                 should be updated.
+    maxlen -  maximum length of the input sequence.
+    batch_size -  Batch Size for training!
+    '''
+    new_mask = tensor.alloc(1, maxlen)
+    qw = tensor.extra_ops.cumsum(new_mask)
+    qw2 = tensor.switch(tensor.eq(tensor.mod(qw,update_freq), 0), 1, 0)
+    temp = qw2
+    for i in range(batch_size - 1):
+        qw2 = tensor.concatenate([qw2,temp], axis=0)
+
+    qw2 = qw2.reshape([batch_size, maxlen])
+    qw2 = qw2.T
+    new_mask =  qw2
+    if update_freq ==1:
+        return new_mask, None, None
+
+    ones_array = numpy.ones([1, maxlen])
+    cumsum = numpy.cumsum(ones_array)
+    mod_array = [int(i%(update_freq)) for i in cumsum]
+    mod_array = numpy.asarray(mod_array)
+    alpha_mask = numpy.where(mod_array==0)[0]
+
+    interpolation_mask = []
+    for i in reversed(range(update_freq)):
+        interpolation_mask.append(((i+1)*1.0)/update_freq)
+
+    return new_mask, alpha_mask, interpolation_mask
+
+
 def train(dim_word=100,  # word vector dimensionality
           dim=1000,  # the number of GRU units
           encoder='gru',
-          patience=10,  # early stopping patience
+          patience=100,  # early stopping patience
           max_epochs=5000,
           finish_after=10000000,  # finish after this many updates
           dispFreq=100,
@@ -924,29 +978,16 @@ def train(dim_word=100,  # word vector dimensionality
     tparams = init_tparams(params)
     print tparams
 
-    new_mask = tensor.alloc(1, maxlen)
-    qw = tensor.extra_ops.cumsum(new_mask)
-    qw2 = tensor.switch(tensor.eq(tensor.mod(qw,2), 0), 1, 0)
-    temp = qw2
-    alpha = qw2
-    for i in range(31):
-        qw2 = tensor.concatenate([qw2,temp], axis=0)
+    update_freq = 5
+    new_mask, alpha_mask, interpolation_mask = time_mask(update_freq, maxlen, batch_size)
 
-    qw2 = qw2.reshape([32,30])
-    qw2 = qw2.T
-    f=theano.function([new_mask], qw2)
-    #print f(numpy.ones(maxlen).astype('int8'))
-    new_mask =  qw2
-
-    alpha = [1,3,5,7,9,11,13,15,17,19,21,23,25,27,29]
-
+    print alpha_mask
+    print interpolation_mask
     # build the symbolic computational graph
-
     trng, use_noise, \
         x, x_mask, \
         opt_ret, \
-        cost, get_hidden = \
-        build_model(tparams, model_options, new_mask, alpha)
+        cost, get_hidden =  build_model(tparams, model_options, new_mask, alpha_mask,   interpolation_mask)
     inps = [x, x_mask]
 
     print 'Buliding sampler'
@@ -1022,12 +1063,10 @@ def train(dim_word=100,  # word vector dimensionality
                 uidx -= 1
                 continue
 
-
-
-            print x.shape
+            #print x.shape
             ud_start = time.time()
-            proj_h = get_hidden(x, x_mask)
-            print numpy.asarray(proj_h).shape
+            #proj_h = get_hidden(x, x_mask, new_mask)
+            #print numpy.asarray(proj_h).shape
             #ipdb.set_trace()
             # compute cost, grads and copy grads to shared variables
             cost = f_grad_shared(x, x_mask)
@@ -1043,8 +1082,8 @@ def train(dim_word=100,  # word vector dimensionality
                 return 1.
 
             # verbose
-            if numpy.mod(uidx, dispFreq) == 0:
-                print 'Epoch ', eidx, 'Update ', uidx, 'Cost ', cost, 'UD ', ud
+           # if numpy.mod(uidx, dispFreq) == 0:
+           #     print 'Epoch ', eidx, 'Update ', uidx, 'Cost ', cost, 'UD ', ud
 
             # save the best model so far
             if numpy.mod(uidx, saveFreq) == 0:
